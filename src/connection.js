@@ -2,6 +2,10 @@ import CDP from 'chrome-remote-interface';
 
 let client = null;
 let targetInfo = null;
+// In-flight connect(), shared by concurrent callers so a burst of tool calls
+// opens one socket instead of racing to overwrite `client` with N of them.
+let connecting = null;
+let connectingTarget;
 // Overridable via TV_CDP_HOST/TV_CDP_PORT (or CDP_HOST/CDP_PORT) env vars.
 // Default is 127.0.0.1, not localhost: on some Windows machines localhost
 // resolves to ::1 first, and Electron's --remote-debugging-port only listens on IPv4.
@@ -9,6 +13,12 @@ export const CDP_HOST = process.env.TV_CDP_HOST || process.env.CDP_HOST || '127.
 export const CDP_PORT = Number(process.env.TV_CDP_PORT || process.env.CDP_PORT) || 9222;
 const MAX_RETRIES = 5;
 const BASE_DELAY = 500;
+// HTTP timeout for /json/list. Without one, a dropped packet (VPN, firewall
+// rule, suspended VM) hangs the fetch — and the MCP tool call — indefinitely.
+const LIST_TIMEOUT = 5000;
+// Cap on the cached-client liveness probe. A half-open websocket accepts the
+// write and never answers, so the probe needs its own deadline.
+const LIVENESS_TIMEOUT = 5000;
 
 // Known direct API paths discovered via live probing (see PROBE_RESULTS.md)
 const KNOWN_PATHS = {
@@ -50,46 +60,129 @@ export function requireFinite(value, name) {
   return n;
 }
 
-export async function getClient() {
-  if (client) {
-    try {
-      // Quick liveness check
-      await client.Runtime.evaluate({ expression: '1', returnByValue: true });
-      return client;
-    } catch {
-      client = null;
-      targetInfo = null;
-    }
-  }
-  return connect();
+function _resolve(deps) {
+  return {
+    cdp: deps?.cdp || CDP,
+    fetch: deps?.fetch || ((...args) => fetch(...args)),
+    delay: deps?.delay || ((ms) => new Promise(r => setTimeout(r, ms))),
+  };
 }
 
-export async function connect(targetId = null) {
+/** Reject if `promise` hasn't settled within `ms`. */
+function withTimeout(promise, ms, label) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(label)), ms);
+      timer.unref?.();
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+/** Drop the cached client, closing its socket so we don't leak the connection. */
+async function dropClient() {
+  const dead = client;
+  client = null;
+  targetInfo = null;
+  if (dead) {
+    try { await dead.close(); } catch { /* already gone */ }
+  }
+}
+
+/**
+ * Turn a raw connect failure into something the user can act on.
+ * The common case — TradingView simply isn't running with CDP enabled —
+ * otherwise surfaces as a bare "fetch failed".
+ */
+function describeError(err) {
+  const msg = err?.message || String(err);
+  const code = err?.code || err?.cause?.code || err?.cause?.name || err?.name;
+  if (code === 'ECONNREFUSED' || /ECONNREFUSED/.test(msg)) {
+    return `nothing is listening on ${CDP_HOST}:${CDP_PORT}. Start TradingView Desktop with --remote-debugging-port=${CDP_PORT} (the tv_launch tool does this for you), or point TV_CDP_HOST/TV_CDP_PORT at where it is listening.`;
+  }
+  if (code === 'TimeoutError' || code === 'ETIMEDOUT' || /timed out/i.test(msg)) {
+    return `${CDP_HOST}:${CDP_PORT} accepted the request but never answered — a firewall or a stale process may be holding the port.`;
+  }
+  return msg;
+}
+
+export async function getClient({ _deps } = {}) {
+  if (client) {
+    try {
+      // Quick liveness check — bounded, because a half-open socket never replies.
+      await withTimeout(
+        client.Runtime.evaluate({ expression: '1', returnByValue: true }),
+        LIVENESS_TIMEOUT,
+        'CDP liveness check timed out',
+      );
+      return client;
+    } catch {
+      await dropClient();
+    }
+  }
+  return connect(null, { _deps });
+}
+
+export async function connect(targetId = null, { _deps } = {}) {
+  // Share an in-flight attempt for the same target; serialize behind one for a
+  // different target so two connects can't both assign `client`.
+  if (connecting) {
+    if (connectingTarget === targetId) return connecting;
+    await connecting.catch(() => {});
+    return connect(targetId, { _deps });
+  }
+  connectingTarget = targetId;
+  connecting = attemptConnect(targetId, _deps).finally(() => {
+    connecting = null;
+    connectingTarget = undefined;
+  });
+  return connecting;
+}
+
+async function attemptConnect(targetId, _deps) {
+  const deps = _resolve(_deps);
   let lastError;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    let fresh = null;
     try {
-      const target = targetId ? await findTargetById(targetId) : await findChartTarget();
+      const target = targetId
+        ? await findTargetById(targetId, deps)
+        : await findChartTarget(deps);
       if (!target) {
         throw new Error(targetId
           ? `CDP target ${targetId} not found — is the tab still open?`
           : 'No TradingView chart target found. Is TradingView open with a chart?');
       }
-      targetInfo = target;
-      client = await CDP({ host: CDP_HOST, port: CDP_PORT, target: target.id });
+
+      fresh = await deps.cdp({ host: CDP_HOST, port: CDP_PORT, target: target.id });
 
       // Enable required domains
-      await client.Runtime.enable();
-      await client.Page.enable();
-      await client.DOM.enable();
+      await fresh.Runtime.enable();
+      await fresh.Page.enable();
+      await fresh.DOM.enable();
 
+      // Forget the client the moment its transport dies, so the next call
+      // reconnects instead of probing a socket we already know is gone.
+      fresh.on?.('disconnect', () => {
+        if (client === fresh) { client = null; targetInfo = null; }
+      });
+
+      client = fresh;
+      targetInfo = target;
       return client;
     } catch (err) {
       lastError = err;
-      const delay = Math.min(BASE_DELAY * Math.pow(2, attempt), 30000);
-      await new Promise(r => setTimeout(r, delay));
+      // CDP() can hand back a socket and a later enable() still throw — closing
+      // it here keeps failed retries from leaking a connection apiece.
+      if (fresh) { try { await fresh.close(); } catch { /* already gone */ } }
+      // No sleep after the final attempt; it only delays the error.
+      if (attempt < MAX_RETRIES - 1) {
+        await deps.delay(Math.min(BASE_DELAY * Math.pow(2, attempt), 30000));
+      }
     }
   }
-  throw new Error(`CDP connection failed after ${MAX_RETRIES} attempts: ${lastError?.message}`);
+  throw new Error(`CDP connection failed after ${MAX_RETRIES} attempts: ${describeError(lastError)}`);
 }
 
 /**
@@ -98,27 +191,45 @@ export async function connect(targetId = null) {
  * quote_get, screenshots) follow the activated tab instead of staying
  * glued to the target picked at first connect.
  */
-export async function reconnectTo(targetId) {
-  if (client) {
-    try { await client.close(); } catch { /* already gone */ }
-    client = null;
-    targetInfo = null;
-  }
-  return connect(targetId);
+export async function reconnectTo(targetId, { _deps } = {}) {
+  await dropClient();
+  return connect(targetId, { _deps });
 }
 
-async function findChartTarget() {
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
+async function listTargets(deps) {
+  let resp;
+  try {
+    resp = await deps.fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`, {
+      signal: AbortSignal.timeout(LIST_TIMEOUT),
+    });
+  } catch (err) {
+    // fetch() reports the real cause (ECONNREFUSED, timeout) on err.cause —
+    // carry it through so describeError() can say what actually went wrong.
+    throw Object.assign(
+      new Error(`Cannot reach CDP at ${CDP_HOST}:${CDP_PORT}: ${err?.message || err}`),
+      { code: err?.code || err?.cause?.code || err?.name, cause: err },
+    );
+  }
+  if (!resp.ok) {
+    throw new Error(`CDP /json/list returned HTTP ${resp.status} — is ${CDP_HOST}:${CDP_PORT} really a DevTools endpoint?`);
+  }
   const targets = await resp.json();
+  if (!Array.isArray(targets)) {
+    throw new Error('CDP /json/list returned an unexpected payload (expected an array of targets)');
+  }
+  return targets;
+}
+
+async function findChartTarget(deps) {
+  const targets = await listTargets(deps);
   // Prefer targets with tradingview.com/chart in the URL
   return targets.find(t => t.type === 'page' && /tradingview\.com\/chart/i.test(t.url))
     || targets.find(t => t.type === 'page' && /tradingview/i.test(t.url))
     || null;
 }
 
-async function findTargetById(id) {
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
-  const targets = await resp.json();
+async function findTargetById(id, deps) {
+  const targets = await listTargets(deps);
   return targets.find(t => t.id === id) || null;
 }
 
@@ -151,11 +262,10 @@ export async function evaluateAsync(expression) {
 }
 
 export async function disconnect() {
-  if (client) {
-    try { await client.close(); } catch {}
-    client = null;
-    targetInfo = null;
-  }
+  // Let any in-flight connect settle first, otherwise it assigns `client`
+  // right after we clear it and the socket outlives the disconnect.
+  if (connecting) await connecting.catch(() => {});
+  await dropClient();
 }
 
 // --- Direct API path helpers ---
